@@ -1,10 +1,21 @@
-use crate::asset_loader::{AssetLoaderState, AssetPack};
-use bevy::gltf::Gltf;
+use crate::asset_loader::AssetLoaderState;
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::ops::Deref;
 use std::time::Duration;
 
 pub struct AnimatedCharacterPlugin;
+
+#[derive(Debug, Component)]
+pub struct SceneId(Entity);
+impl SceneId {
+    pub fn new(id: Entity) -> Self {
+        Self(id)
+    }
+    pub fn get_id(&self) -> Entity {
+        self.0
+    }
+}
 
 #[derive(Debug, Component)]
 pub struct PlayerCharacterName(String);
@@ -12,20 +23,25 @@ impl PlayerCharacterName {
     pub fn new<T: Into<String>>(name: T) -> Self {
         Self(name.into())
     }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 // Resource: Shared graph + name-to-index mapping
 #[derive(Resource)]
-struct CharacterAnimationResources {
-    graph: Handle<AnimationGraph>,
-    named_nodes: HashMap<String, AnimationNodeIndex>,
+pub(crate) struct CharacterAnimationResource {
+    pub(crate) scene_id: Entity,
+    pub(crate) graph: Handle<AnimationGraph>,
+    pub(crate) named_nodes: HashMap<String, AnimationNodeIndex>,
+    pub(crate) name: String,
+    pub(crate) animation_player_id: Option<Entity>,
+}
+#[derive(Resource)]
+pub(crate) struct CharacterAnimationResources {
+    pub(crate) characters: HashMap<String, CharacterAnimationResource>,
 }
 impl Plugin for AnimatedCharacterPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(AssetLoaderState::Done), spawn_characters);
-        app.add_systems(
-            Update,
-            run_animations.run_if(in_state(AssetLoaderState::Done)),
-        );
         app.add_systems(
             Update,
             keyboard_control.run_if(in_state(AssetLoaderState::Done)),
@@ -33,107 +49,51 @@ impl Plugin for AnimatedCharacterPlugin {
     }
 }
 
-fn spawn_characters(
-    mut commands: Commands,
-    asset_pack: Res<AssetPack>,
-    assets_gltf: Res<Assets<Gltf>>,
-    mut graphs: ResMut<Assets<AnimationGraph>>,
-) {
-    let gltf = assets_gltf.get(&asset_pack.0).unwrap();
-
-    commands.spawn((
-        SceneRoot(gltf.named_scenes["Scene"].clone()),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        PlayerCharacterName::new("one"),
-    ));
-    commands.spawn((
-        SceneRoot(gltf.named_scenes["Scene"].clone()),
-        Transform::from_xyz(2.0, 0.0, 0.0),
-        PlayerCharacterName::new("two"),
-    ));
-
-    // Get named clips (your "Idle", "Death")
-    let named_clips: HashMap<String, Handle<AnimationClip>> = gltf
-        .named_animations
-        .iter()
-        .map(|(name, handle)| (name.to_string(), handle.clone()))
-        .collect();
-
-    // Build simple graph: root → parallel leaves (one per clip)
-    let mut animation_graph = AnimationGraph::new();
-    let blend_node = animation_graph.add_blend(0.5, animation_graph.root);
-
-    let mut named_nodes: HashMap<String, AnimationNodeIndex> = HashMap::new();
-    for (name, clip_handle) in named_clips {
-        let node_index = animation_graph.add_clip(clip_handle, 1.0, blend_node);
-        dbg!(&name, node_index);
-        named_nodes.insert(name, node_index);
-    }
-
-    let handle = graphs.add(animation_graph);
-
-    commands.insert_resource(CharacterAnimationResources {
-        graph: handle,
-        named_nodes,
-    });
-}
-
-fn run_animations(
-    mut commands: Commands,
-    mut animation_player_query: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
-    animations: Res<CharacterAnimationResources>,
-) {
-    for (entity, mut player) in &mut animation_player_query {
-        //let player_name = PlayerCharacterName::new("one");
-        let mut transitions = AnimationTransitions::new();
-        transitions
-            .play(
-                &mut player,
-                animations.named_nodes.get("Idle").unwrap().to_owned(),
-                Duration::ZERO,
-            )
-            .repeat()
-            .set_speed(10.0);
-
-        commands
-            .entity(entity)
-            .insert(AnimationGraphHandle(animations.graph.clone()))
-            .insert(transitions);
-    }
-}
-
 fn keyboard_control(
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-    animations: Res<CharacterAnimationResources>,
+    mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions, &SceneId)>,
+    animation_resources: Res<CharacterAnimationResources>,
     mut current_animation: Local<usize>,
+    mut animate: Local<bool>,
 ) {
-    for (mut player, _) in &mut animation_players {
-        let Some((&playing_animation_index, _)) = player.playing_animations().next() else {
-            continue;
-        };
-        if keyboard_input.just_pressed(KeyCode::Space) {
+    if keyboard_input.just_pressed(KeyCode::Space) {
+        for (mut player, _, _) in &mut animation_players {
+            let Some((&playing_animation_index, _)) = player.playing_animations().next() else {
+                println!("No playing animations found");
+                continue;
+            };
             let playing_animation = player.animation_mut(playing_animation_index).unwrap();
-            if playing_animation.is_paused() {
-                playing_animation.resume();
-            } else {
+
+            println!("playing_animation: {:?}", playing_animation);
+            if *animate {
                 playing_animation.pause();
+            } else {
+                playing_animation.resume();
             }
         }
+        *animate = !*animate;
+        println!("animated {}", *animate);
     }
-    if keyboard_input.just_pressed(KeyCode::KeyS) {
-        *current_animation = (*current_animation + 1) % animations.named_nodes.len();
 
-        let (animation_name, animation_node_index) = animations
-            .named_nodes
-            .iter()
-            .nth(*current_animation)
-            .unwrap();
+    if keyboard_input.just_pressed(KeyCode::KeyA) {
+        for (mut player, mut transitions, id) in &mut animation_players {
+            let animations = animation_resources
+                .characters
+                .values()
+                .find(|v| v.scene_id == id.get_id())
+                .unwrap();
+            *current_animation = (*current_animation + 1);
 
-        println!("Change animation state to {}", animation_name);
+            let (animation_name, animation_node_index) = animations
+                .named_nodes
+                .iter()
+                .nth(*current_animation % animations.named_nodes.len())
+                .unwrap();
 
-        for (mut player, mut transitions) in &mut animation_players {
+            println!("Change animation state to {}", animation_name);
+
             if player.playing_animations().next().is_none() {
+                println!("No playing animations found");
                 continue;
             };
 
@@ -145,5 +105,40 @@ fn keyboard_control(
                 )
                 .repeat();
         }
+    }
+
+    if keyboard_input.just_pressed(KeyCode::KeyS) {
+        let Some(character) = animation_resources.characters.get("Cleric") else {
+            return;
+        };
+        *current_animation = (*current_animation + 1) % character.named_nodes.len();
+
+        let (animation_name, animation_node_index) = character
+            .named_nodes
+            .iter()
+            .nth(*current_animation)
+            .unwrap();
+
+        println!("Change animation state to {}", animation_name);
+
+        let Ok((mut player, mut transitions, _)) =
+            animation_players.get_mut(character.animation_player_id.unwrap())
+        else {
+            println!("No playing animations found");
+            return;
+        };
+
+        if player.playing_animations().next().is_none() {
+            println!("No playing animations found");
+            return;
+        };
+
+        transitions
+            .play(
+                &mut player,
+                *animation_node_index,
+                Duration::from_millis(250),
+            )
+            .repeat();
     }
 }
